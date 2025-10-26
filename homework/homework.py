@@ -96,3 +96,199 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+
+import os
+import json
+import gzip
+import pickle
+from glob import glob
+from pathlib import Path
+from typing import Any, Dict, List
+
+import pandas as pd
+from sklearn.decomposition import PCA
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.neural_network import MLPClassifier
+from sklearn.model_selection import GridSearchCV
+from sklearn.metrics import (
+    precision_score,
+    recall_score,
+    f1_score,
+    balanced_accuracy_score,
+    confusion_matrix,
+)
+
+
+class Paths:
+    BASE = Path("files")
+    INPUT = BASE / "input"
+    MODELS = BASE / "models"
+    OUTPUT = BASE / "output"
+
+    TRAIN = INPUT / "train_data.csv.zip"
+    TEST = INPUT / "test_data.csv.zip"
+    MODEL_FILE = MODELS / "model.pkl.gz"
+    METRICS_FILE = OUTPUT / "metrics.json"
+
+
+# ---------------------------------------------------------------------------
+# Limpieza de datos
+# ---------------------------------------------------------------------------
+
+def preparar_datos(archivo_zip: Path) -> pd.DataFrame:
+    """Lee, limpia y prepara los datos según las reglas especificadas."""
+    data = pd.read_csv(archivo_zip, compression="zip").copy()
+
+    # Renombrar y eliminar columnas no necesarias
+    if "default payment next month" in data.columns:
+        data.rename(columns={"default payment next month": "default"}, inplace=True)
+    data.drop(columns=[c for c in ["ID"] if c in data.columns], inplace=True, errors="ignore")
+
+    # Filtrar valores inválidos
+    data = data[(data["MARRIAGE"] != 0) & (data["EDUCATION"] != 0)]
+    data["EDUCATION"] = data["EDUCATION"].apply(lambda v: 4 if v > 4 else v)
+
+    return data.dropna()
+
+
+# ---------------------------------------------------------------------------
+# Utilidades
+# ---------------------------------------------------------------------------
+
+def limpiar_carpeta(path: Path) -> None:
+    """Elimina y recrea el contenido de una carpeta."""
+    if path.exists():
+        for archivo in glob(str(path / "*")):
+            os.remove(archivo)
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def guardar_comprimido(obj: Any, ruta: Path) -> None:
+    """Guarda un objeto serializado en formato gzip."""
+    with gzip.open(ruta, "wb") as f:
+        pickle.dump(obj, f)
+
+
+def registrar_metricas(lista_registros: List[Dict[str, Any]], destino: Path) -> None:
+    """Guarda métricas o matrices de confusión en formato JSON línea a línea."""
+    destino.parent.mkdir(parents=True, exist_ok=True)
+    with open(destino, "w", encoding="utf-8") as f:
+        for registro in lista_registros:
+            f.write(json.dumps(registro) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Métricas y evaluación
+# ---------------------------------------------------------------------------
+
+def obtener_metricas(nombre: str, y_true, y_pred) -> Dict[str, Any]:
+    """Calcula métricas principales de rendimiento."""
+    return {
+        "type": "metrics",
+        "dataset": nombre,
+        "precision": precision_score(y_true, y_pred, zero_division=0),
+        "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
+        "recall": recall_score(y_true, y_pred, zero_division=0),
+        "f1_score": f1_score(y_true, y_pred, zero_division=0),
+    }
+
+
+def obtener_confusion(nombre: str, y_true, y_pred) -> Dict[str, Any]:
+    """Devuelve la matriz de confusión formateada."""
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+    return {
+        "type": "cm_matrix",
+        "dataset": nombre,
+        "true_0": {"predicted_0": int(tn), "predicted_1": int(fp)},
+        "true_1": {"predicted_0": int(fn), "predicted_1": int(tp)},
+    }
+
+
+# ---------------------------------------------------------------------------
+# Construcción del modelo
+# ---------------------------------------------------------------------------
+
+def crear_pipeline(vars_cat: List[str], vars_num: List[str]) -> GridSearchCV:
+    """Define el pipeline completo y la búsqueda de hiperparámetros."""
+
+    preprocesador = ColumnTransformer(
+        transformers=[
+            ("categorical", OneHotEncoder(handle_unknown="ignore"), vars_cat),
+            ("numeric", StandardScaler(), vars_num),
+        ]
+    )
+
+    modelo = Pipeline(
+        steps=[
+            ("preprocessor", preprocesador),
+            ("selector", SelectKBest(score_func=f_classif)),
+            ("pca", PCA()),
+            ("mlp", MLPClassifier(max_iter=15000, random_state=21)),
+        ]
+    )
+
+    grid = {
+        "selector__k": [20],
+        "pca__n_components": [None],
+        "mlp__hidden_layer_sizes": [(50, 30, 40, 60)],
+        "mlp__alpha": [0.26],
+        "mlp__learning_rate_init": [0.001],
+    }
+
+    return GridSearchCV(
+        estimator=modelo,
+        param_grid=grid,
+        cv=10,
+        n_jobs=-1,
+        scoring="balanced_accuracy",
+        verbose=2,
+        refit=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Ejecución principal
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    """Ejecución principal del script de modelado."""
+    # Carga y limpieza
+    train_df = preparar_datos(Paths.TRAIN)
+    test_df = preparar_datos(Paths.TEST)
+
+    X_train = train_df.drop(columns=["default"])
+    y_train = train_df["default"]
+    X_test = test_df.drop(columns=["default"])
+    y_test = test_df["default"]
+
+    cat_features = ["SEX", "EDUCATION", "MARRIAGE"]
+    num_features = [c for c in X_train.columns if c not in cat_features]
+
+    # Construcción y entrenamiento
+    grid_model = crear_pipeline(cat_features, num_features)
+    grid_model.fit(X_train, y_train)
+
+    # Guardar modelo
+    limpiar_carpeta(Paths.MODELS)
+    guardar_comprimido(grid_model, Paths.MODEL_FILE)
+
+    # Predicciones
+    y_train_pred = grid_model.predict(X_train)
+    y_test_pred = grid_model.predict(X_test)
+
+    # Cálculo y almacenamiento de métricas
+    resultados = [
+        obtener_metricas("train", y_train, y_train_pred),
+        obtener_metricas("test", y_test, y_test_pred),
+        obtener_confusion("train", y_train, y_train_pred),
+        obtener_confusion("test", y_test, y_test_pred),
+    ]
+
+    registrar_metricas(resultados, Paths.METRICS_FILE)
+
+
+if __name__ == "__main__":
+    main()
